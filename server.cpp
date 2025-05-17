@@ -1,177 +1,245 @@
 #include <iostream>
-#include <cstring>
 #include <thread>
 #include <mutex>
-#include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstring>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <unordered_map>
- #include <stdarg.h>
+#include <stdarg.h>
+#include <vector>
+#include <sstream>
+#include <fstream>
+#include <ctime>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/exception.h>
 
-#define SERVER_PORT 5208 //侦听端口
+#define SERVER_PORT 5208
 #define BUF_SIZE 1024
-#define MAX_CLNT 256    // 最大连接数
+#define MAX_CLNT 256
 
-void handle_clnt(int clnt_sock);
-void send_msg(const std::string &msg);
-int output(const char *arg,...);
-int error_output(const char *arg,...);
-void error_handling(const std::string &message);
+class ChatServer {
+private:
+    int serverSocket;
+    std::mutex mtx; 
+    std::unordered_map<std::string, int> clientSockets;
+    std::unordered_map<int, std::string> socketToClient;
+    std::unordered_map<std::string, std::unordered_set<std::string>> groups;
+    int clientCount = 0;
+    sql::mysql::MySQL_Driver* driver;
+    std::unique_ptr<sql::Connection> conn;
+    std::unique_ptr<sql::PreparedStatement> pstmt;
 
-int clnt_cnt = 0;
-std::mutex mtx;
-// 用unordered_map存储每个client的名字和socket
-std::unordered_map<std::string, int>clnt_socks;
+public:
+    ChatServer();
+    ~ChatServer();
+    void start();
 
-int main(int argc,const char **argv,const char **envp){
-    int serv_sock,clnt_sock;
-    struct sockaddr_in serv_addr, clnt_addr;
-    socklen_t clnt_addr_size;
+private:
+    void handleClient(int clientSocket);
+    void sendMessage(const std::string& msg);
+    void sendGroupMessage(const std::string& group, const std::string& sender, const std::string& content);
+    void removeClient(int clientSocket);
+    void logChat(const std::string& sender, const std::string& receiver, const std::string& msg);
+    static int output(const char *arg, ...);
+    static int error_output(const char *arg, ...);
+    static void error_handling(const std::string &message);
+};
 
-    // 创建套接字，参数说明：
-    //   AF_INET: 使用 IPv4
-    //   SOCK_STREAM: 面向连接的数据传输方式
-    //   IPPROTO_TCP: 使用 TCP 协议
-    serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (serv_sock == -1){
+ChatServer::ChatServer() {
+    serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (serverSocket == -1) {
         error_handling("socket() failed!");
     }
-    // 将套接字和指定的 IP、端口绑定
-    //   用 0 填充 serv_addr （它是一个 sockaddr_in 结构体）
-    memset(&serv_addr,0, sizeof(serv_addr));
-    //   设置 IPv4
-    //   设置 IP 地址
-    //   设置端口
+
+    sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    // serv_addr.sin_port=htons(atoi(argv[1]));
     serv_addr.sin_port = htons(SERVER_PORT);
 
-    //   绑定
-    if (bind(serv_sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1){
+    if (bind(serverSocket, (sockaddr*)&serv_addr, sizeof(serv_addr)) == -1) {
         error_handling("bind() failed!");
     }
-    printf("the server is running on port %d\n", SERVER_PORT);
-    // 使得 serv_sock 套接字进入监听状态，开始等待客户端发起请求
-    if (listen(serv_sock, MAX_CLNT) == -1){
+
+    if (listen(serverSocket, MAX_CLNT) == -1) {
         error_handling("listen() error!");
     }
 
-    while(1){   // 循环监听客户端，永远不停止
-        clnt_addr_size = sizeof(clnt_addr);
-        // 当没有客户端连接时， accept() 会阻塞程序执行，直到有客户端连接进来
-        clnt_sock = accept(serv_sock, (struct sockaddr*)&clnt_addr, &clnt_addr_size);
-        if (clnt_sock == -1){
+    try {
+        driver = sql::mysql::get_mysql_driver_instance();
+        conn.reset(driver->connect("tcp://127.0.0.1:3306", "root", "12345"));
+        conn->setSchema("chatdb");
+        pstmt.reset(conn->prepareStatement("INSERT INTO chat_logs(sender, receiver, message) VALUES (?, ?, ?)"));
+    } catch (sql::SQLException &e) {
+        error_handling("MySQL Connection failed: " + std::string(e.what()));
+    }
+
+    output("The server is running on port %d\n", SERVER_PORT);
+}
+
+ChatServer::~ChatServer() {
+    close(serverSocket);
+}
+
+void ChatServer::start() {
+    while (true) {
+        sockaddr_in clnt_addr{};
+        socklen_t clnt_addr_size = sizeof(clnt_addr);
+        int clnt_sock = accept(serverSocket, (sockaddr*)&clnt_addr, &clnt_addr_size);
+        if (clnt_sock == -1) {
             error_handling("accept() failed!");
         }
 
-        // 增加客户端数量
-        mtx.lock();
-        clnt_cnt++;
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            clientCount++;
+        }
 
-        // 生成线程
-        std::thread th(handle_clnt, clnt_sock);
-        th.detach();
-
-        output("Connected client IP: %s \n", inet_ntoa(clnt_addr.sin_addr));
+        std::thread(&ChatServer::handleClient, this, clnt_sock).detach();
+        output("Connected client IP: %s\n", inet_ntoa(clnt_addr.sin_addr));
     }
-    close(serv_sock);
-    return 0;
-}
+} 
 
-void handle_clnt(int clnt_sock){
+void ChatServer::handleClient(int clientSocket) {
     char msg[BUF_SIZE];
     int flag = 0;
+    const std::string tell_name = "#new client:";
 
-    // 第一次广播自己的名字时的前缀
-    char tell_name[13] = "#new client:";
-    while(recv(clnt_sock, msg, sizeof(msg),0) != 0){
-        // 检查是否为第一次进入聊天室时的广播
-        if (std::strlen(msg) > std::strlen(tell_name)) {
-            // 判断msg最前面是否为 #new client:
-            char pre_name[13];
-            std::strncpy(pre_name, msg, 12);
-            pre_name[12] = '\0';
-            if (std::strcmp(pre_name, tell_name) == 0) {
-                // 此消息声明client名字
-                char name[20];
-                std::strcpy(name, msg+12);
-                if(clnt_socks.find(name) == clnt_socks.end()){
-                    output("the name of socket %d: %s\n", clnt_sock, name);
-                    clnt_socks[name] = clnt_sock;
-                }
-                else {
-                    // 客户端名字重复
-                    std::string error_msg = std::string(name) + " exists already. Please quit and enter with another name!";
-                    send(clnt_sock, error_msg.c_str(), error_msg.length()+1, 0);
-                    mtx.lock();
-                    clnt_cnt--;
-                    mtx.unlock();
-                    flag = 1;
+    while (recv(clientSocket, msg, sizeof(msg), 0) > 0) {
+        std::string message(msg);
+
+        if (message.substr(0, tell_name.size()) == tell_name) {
+            std::string name = message.substr(tell_name.size());
+            std::lock_guard<std::mutex> lock(mtx);
+            if (clientSockets.find(name) == clientSockets.end()) {
+                clientSockets[name] = clientSocket;
+                socketToClient[clientSocket] = name;
+                output("the name of socket %d: %s\n", clientSocket, name.c_str());
+            } else {
+                std::string error_msg = name + " exists already. Please quit and enter with another name!";
+                send(clientSocket, error_msg.c_str(), error_msg.length() + 1, 0);
+                clientCount--;
+                flag = 1;
+                break;
+            }
+        } else if (message.substr(0, 6) == "#group") {
+            std::istringstream iss(message);
+            std::string cmd, groupName, member;
+            iss >> cmd >> groupName;
+            std::unordered_set<std::string> members;
+            while (iss >> member) {
+                members.insert(member);
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            groups[groupName] = members;
+        } else if (message.substr(0, 6) == "#sendg") {
+            size_t sep = message.find(":");
+            if (sep == std::string::npos) continue;
+
+            std::string groupInfo = message.substr(6, sep - 6);
+            std::string content = message.substr(sep + 1);
+
+            std::string sender;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                sender = socketToClient[clientSocket];
+            }
+
+            sendGroupMessage(groupInfo, sender, content);
+        } else if (message.substr(0, 8) == "#sendto:") {
+            size_t sep = message.find(":", 8);
+            if (sep == std::string::npos) continue;
+
+            std::string receiver = message.substr(8, sep - 8);
+            std::string content = message.substr(sep + 1);
+
+            std::string sender;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                sender = socketToClient[clientSocket];
+            }
+
+            std::string formatted = "[Private] " + sender + " to " + receiver + ": " + content;
+
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (clientSockets.find(receiver) != clientSockets.end()) {
+                    send(clientSockets[receiver], formatted.c_str(), formatted.length() + 1, 0);
+                    send(clientSocket, formatted.c_str(), formatted.length() + 1, 0);
+                    logChat(sender, receiver, content);
+                } else {
+                    std::string err = "User " + receiver + " not found.";
+                    send(clientSocket, err.c_str(), err.length() + 1, 0);
                 }
             }
-        }
-
-        if(flag == 0)
-            send_msg(std::string(msg));
-    }
-    if(flag == 0){
-        // 客户端关闭连接，从clnt_socks中删除此客户端
-        std::string leave_msg;
-        std::string name;
-        mtx.lock();
-        for (auto it = clnt_socks.begin(); it != clnt_socks.end(); ++it ){
-            if(it->second == clnt_sock){
-                name = it->first;
-                clnt_socks.erase(it->first);
+        } else {
+            std::string sender, receiver = "all";
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                sender = socketToClient[clientSocket];
             }
+
+            std::string formattedMsg = sender + ": " + message;
+
+            logChat(sender, receiver, message);
+            sendMessage(formattedMsg);
         }
-        clnt_cnt--;
-        mtx.unlock();
-        leave_msg = "client " + name + " leaves the chat room";
-        send_msg(leave_msg);
-        output("client %s leaves the chat room\n", name.c_str());
-        close(clnt_sock);
     }
-    else {
-        close(clnt_sock);
+
+    if (flag == 0) {
+        removeClient(clientSocket);
+    }
+    close(clientSocket);
+}
+
+void ChatServer::removeClient(int clientSocket) {
+    std::lock_guard<std::mutex> lock(mtx);
+    std::string name = socketToClient[clientSocket];
+    clientSockets.erase(name);
+    socketToClient.erase(clientSocket);
+    clientCount--;
+
+    std::string leave_msg = "client " + name + " leaves the chat room";
+    sendMessage(leave_msg);
+    output("client %s leaves the chat room\n", name.c_str());
+}
+
+void ChatServer::sendGroupMessage(const std::string& group, const std::string& sender, const std::string& content) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (groups.find(group) == groups.end()) return;
+
+    std::string fullMsg = "[Group: " + group + "] " + sender + ": " + content;
+    for (const auto& member : groups[group]) {
+        if (clientSockets.find(member) != clientSockets.end()) {
+            send(clientSockets[member], fullMsg.c_str(), fullMsg.length() + 1, 0);
+            logChat(sender, member, content);
+        }
     }
 }
 
-void send_msg(const std::string &msg){
-    mtx.lock();
-    // 私聊msg格式: [send_clnt] @recv_clnt message
-    // 判断[send_clnt] 后是否为@ 若是则是私聊
-    std::string pre = "@";
-    int first_space = msg.find_first_of(" ");
-    if (msg.compare(first_space+1, 1, pre) == 0){
-        // 单播
-        // space为recv_clnt和消息间的空格
-        int space = msg.find_first_of(" ", first_space+1);
-        std::string receive_name = msg.substr(first_space+2, space-first_space-2);
-        std::string send_name = msg.substr(1, first_space-2);
-        if(clnt_socks.find(receive_name) == clnt_socks.end()) {
-            // 如果私聊的用户不存在
-            std::string error_msg = "[error] there is no client named " + receive_name;
-            send(clnt_socks[send_name], error_msg.c_str(), error_msg.length()+1, 0);
-        }
-        else {
-            send(clnt_socks[receive_name], msg.c_str(), msg.length()+1, 0);
-            send(clnt_socks[send_name], msg.c_str(), msg.length()+1, 0);
-        }
+void ChatServer::sendMessage(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto& it : clientSockets) {
+        send(it.second, msg.c_str(), msg.length() + 1, 0);
     }
-    else {
-        // 广播
-        for (auto it = clnt_socks.begin(); it != clnt_socks.end(); it++) {
-            send(it->second, msg.c_str(), msg.length()+1, 0);
-        }
-    }
-    mtx.unlock();
 }
 
-int output(const char *arg, ...){
+void ChatServer::logChat(const std::string& sender, const std::string& receiver, const std::string& msg) {
+    try {
+        std::lock_guard<std::mutex> lock(mtx);
+        pstmt->setString(1, sender);
+        pstmt->setString(2, receiver);
+        pstmt->setString(3, msg);
+        pstmt->execute();
+    } catch (sql::SQLException &e) {
+        error_output("Failed to log message: %s\n", e.what());
+    }
+}
+
+int ChatServer::output(const char *arg, ...) {
     int res;
     va_list ap;
     va_start(ap, arg);
@@ -180,7 +248,7 @@ int output(const char *arg, ...){
     return res;
 }
 
-int error_output(const char *arg, ...){
+int ChatServer::error_output(const char *arg, ...) {
     int res;
     va_list ap;
     va_start(ap, arg);
@@ -189,7 +257,13 @@ int error_output(const char *arg, ...){
     return res;
 }
 
-void error_handling(const std::string &message){
-    std::cerr<<message<<std::endl;
+void ChatServer::error_handling(const std::string &message) {
+    std::cerr << message << std::endl;
     exit(1);
+}
+
+int main() {
+    ChatServer server;
+    server.start();
+    return 0;
 }
